@@ -145,7 +145,9 @@ def check_self(log: logging.Logger) -> list[tuple[str, bool, str]]:
         try:
             with open(MAILGUN_SECRETS) as f:
                 data = json.load(f)
-            has_keys = all(k in data for k in ["MAILGUN_SMTP_SERVER", "MAILGUN_SMTP_USERNAME", "MAILGUN_SMTP_PASSWORD"])
+            has_api = all(k in data for k in ["MAILGUN_API_KEY", "MAILGUN_DOMAIN"])
+            has_smtp = all(k in data for k in ["MAILGUN_SMTP_SERVER", "MAILGUN_SMTP_USERNAME", "MAILGUN_SMTP_PASSWORD"])
+            has_keys = has_api or has_smtp
             checks.append(("mailgun_secrets", has_keys, "All required keys present" if has_keys else "Missing required keys"))
         except Exception as e:
             checks.append(("mailgun_secrets", False, f"Cannot parse: {e}"))
@@ -649,12 +651,66 @@ def load_mailgun_credentials() -> Optional[dict]:
 
 
 def _send_email(subject: str, plain_body: str, html_body: Optional[str] = None) -> bool:
-    """Send an email via Mailgun SMTP. Supports HTML + plain text fallback."""
+    """Send email via Mailgun HTTP API (primary) or SMTP (fallback)."""
     creds = load_mailgun_credentials()
     if not creds:
         print("WARNING: Cannot send email — Mailgun secrets not found", file=sys.stderr)
         return False
 
+    # Try HTTP API first
+    if "MAILGUN_API_KEY" in creds and "MAILGUN_DOMAIN" in creds:
+        if _send_via_api(creds, subject, plain_body, html_body):
+            return True
+        print("WARNING: API send failed, trying SMTP fallback...", file=sys.stderr)
+
+    # Fall back to SMTP
+    if "MAILGUN_SMTP_SERVER" in creds:
+        return _send_via_smtp(creds, subject, plain_body, html_body)
+
+    print("WARNING: No valid Mailgun credentials (need API_KEY+DOMAIN or SMTP config)", file=sys.stderr)
+    return False
+
+
+def _send_via_api(creds: dict, subject: str, plain_body: str, html_body: Optional[str] = None) -> bool:
+    """Send email via Mailgun HTTP API. Stdlib-only (urllib)."""
+    import base64
+    from urllib.request import Request, urlopen
+    from urllib.parse import urlencode
+    from urllib.error import URLError, HTTPError
+
+    domain = creds["MAILGUN_DOMAIN"]
+    api_key = creds["MAILGUN_API_KEY"]
+    region = creds.get("MAILGUN_REGION", "us")
+    from_addr = creds.get("MAILGUN_FROM", f"Cron Job Manager <postmaster@{domain}>")
+
+    base_url = "https://api.mailgun.net" if region == "us" else "https://api.eu.mailgun.net"
+    url = f"{base_url}/v3/{domain}/messages"
+
+    data = {
+        "from": from_addr,
+        "to": ALERT_TO,
+        "subject": subject,
+        "text": plain_body,
+    }
+    if html_body:
+        data["html"] = html_body
+
+    encoded = urlencode(data).encode("utf-8")
+    auth = base64.b64encode(f"api:{api_key}".encode()).decode()
+
+    req = Request(url, data=encoded, method="POST")
+    req.add_header("Authorization", f"Basic {auth}")
+
+    try:
+        with urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except (HTTPError, URLError, OSError) as e:
+        print(f"WARNING: Mailgun API error: {e}", file=sys.stderr)
+        return False
+
+
+def _send_via_smtp(creds: dict, subject: str, plain_body: str, html_body: Optional[str] = None) -> bool:
+    """Send email via Mailgun SMTP (fallback)."""
     if html_body:
         msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(plain_body, "plain", "utf-8"))
@@ -674,7 +730,7 @@ def _send_email(subject: str, plain_body: str, html_body: Optional[str] = None) 
         server.quit()
         return True
     except Exception as e:
-        print(f"WARNING: Email failed: {e}", file=sys.stderr)
+        print(f"WARNING: SMTP failed: {e}", file=sys.stderr)
         return False
 
 
