@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.watchdog-booted
+.cron-manager-booted
